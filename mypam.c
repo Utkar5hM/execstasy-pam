@@ -1,5 +1,6 @@
 #define PAM_SM_AUTH
 #include <security/pam_modules.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <syslog.h>
 #include <stdarg.h>
@@ -12,10 +13,19 @@
 #include <limits.h>
 #include <pwd.h>
 #include <stdint.h>
+#include <config.h>
+#include <curl/curl.h>
+#include "base32.h"
+
+#ifdef HAVE_SYS_FSUID_H
+// We much rather prefer to use setfsuid(), but this function is unfortunately
+// not available on all systems.
+#include <sys/fsuid.h>
+#endif
 
 #define MODULE_NAME   "pamshi_auth"
 
-#define SECRET	"~/.pamshi"
+#define SECRET	"/etc/pamshi/.config"
 #define CODE_PROMPT "Verification code: "
 #define PWCODE_PROMPT "Password & verification code: "
 
@@ -23,7 +33,6 @@ typedef struct Params{
 	const char* secret_filename_spec;
 	const char *authtok_prompt;
 	enum { NULLERR=0, NULLOK, SECRETNOTFOUND } nullok;
-	enum { PROMPT = 0, TRY_FIRST_PASS, USE_FIRST_PASS } pass_mode;
 	int debug;
 	int echocode;
 	int fixed_uid;
@@ -34,6 +43,9 @@ typedef struct Params{
 	time_t grace_period;
 } Params;
 
+static char oom;
+
+static const char* nobody = "nobody";
 
 static void log_message(int priority, pam_handle_t *pamh,
 				const char* format, ...) {
@@ -82,6 +94,25 @@ static const char* get_user_name(pam_handle_t *pamh, const Params *params){
 # define UNUSED_ATTR
 # endif
 # endif
+
+/*
+ * Return rhost as a string. Return value must not be free()ed.
+ * Returns NULL if PAM_RHOST is not known.
+ */
+static const char *
+get_rhost(pam_handle_t *pamh, const Params *params) {
+  // Get the remote host
+  PAM_CONST void *rhost;
+  if (pam_get_item(pamh, PAM_RHOST, &rhost) != PAM_SUCCESS) {
+    log_message(LOG_ERR, pamh, "pam_get_rhost() failed to get the remote host");
+    return NULL;
+  }
+  if (params->debug) {
+    log_message(LOG_INFO, pamh, "debug: pamshi for host \"%s\"",
+                rhost);
+  }
+  return (const char *)rhost;
+}
 
 static size_t
 getpwnam_buf_max_size() {
@@ -135,10 +166,698 @@ static char *get_secret_filename(pam_handle_t *pamh, const Params *params,
 			goto errout;
 		}
 
+		if (*pw->pw_dir != '/') {
+			log_message(LOG_ERR, pamh, "User \"%s\" home dir not absolute", username);
+			goto errout;
+		}
 	}
+
+
+	// Expand filename specification to an actual filename.
+	if ((secret_filename = strdup(spec)) == NULL) {
+		log_message(LOG_ERR, pamh, "Short (%d) mem allocation failed", strlen(spec));
+		goto errout;
+	}
+	int allow_tilde = 1;
+	for (int offset = 0; secret_filename[offset];) {
+		char *cur = secret_filename + offset;
+		char *var = NULL;
+		size_t var_len = 0;
+		const char *subst = NULL;
+		if (allow_tilde && *cur == '~') {
+		var_len = 1;
+		if (!pw) {
+			log_message(LOG_ERR, pamh,
+						"Home dir in 'secret' not implemented when 'user' set");
+			goto errout;
+		}
+		subst = pw->pw_dir;
+		var = cur;
+		} else if (secret_filename[offset] == '$') {
+		if (!memcmp(cur, "${HOME}", 7)) {
+			var_len = 7;
+			if (!pw) {
+			log_message(LOG_ERR, pamh,
+						"Home dir in 'secret' not implemented when 'user' set");
+			goto errout;
+			}
+			subst = pw->pw_dir;
+			var = cur;
+		} else if (!memcmp(cur, "${USER}", 7)) {
+			var_len = 7;
+			subst = username;
+			var = cur;
+		}
+		}
+		if (var) {
+		const size_t subst_len = strlen(subst);
+		if (subst_len > 1000000) {
+			log_message(LOG_ERR, pamh, "Unexpectedly large path name: %d", subst_len);
+			goto errout;
+		}
+		const int varidx = var - secret_filename;
+		char *resized = realloc(secret_filename,
+								strlen(secret_filename) + subst_len + 1);
+		if (!resized) {
+			log_message(LOG_ERR, pamh, "Short mem allocation failed");
+			goto errout;
+		}
+		var = resized + varidx;
+		secret_filename = resized;
+		memmove(var + subst_len, var + var_len, strlen(var + var_len) + 1);
+		memmove(var, subst, subst_len);
+		offset = var + subst_len - resized;
+		allow_tilde = 0;
+		} else {
+		allow_tilde = *cur == '/';
+		++offset;
+		}
+	}
+
+	*uid = params->fixed_uid ? params->uid : pw->pw_uid;
+	free(buf);
+	return secret_filename;
+
+	errout:
+	free(secret_filename);
+	free(buf);
+	return NULL;
 }
-		
-		
+
+
+static int setuser(int uid) {
+#ifdef HAVE_SETFSUID
+  // The semantics for setfsuid() are a little unusual. On success, the
+  // previous user id is returned. On failure, the current user id is returned.
+  int old_uid = setfsuid(uid);
+  if (uid != setfsuid(uid)) {
+    setfsuid(old_uid);
+    return -1;
+  }
+#else
+#ifdef linux
+#error "Linux should have setfsuid(). Refusing to build."
+#endif
+  int old_uid = geteuid();
+  if (old_uid != uid && seteuid(uid)) {
+    return -1;
+  }
+#endif
+  return old_uid;
+}
+
+static int setgroup(int gid) {
+#ifdef HAVE_SETFSGID
+  // The semantics of setfsgid() are a little unusual. On success, the
+  // previous group id is returned. On failure, the current groupd id is
+  // returned.
+  int old_gid = setfsgid(gid);
+  if (gid != setfsgid(gid)) {
+    setfsgid(old_gid);
+    return -1;
+  }
+#else
+  int old_gid = getegid();
+  if (old_gid != gid && setegid(gid)) {
+    return -1;
+  }
+#endif
+  return old_gid;
+}
+
+// Drop privileges and return 0 on success.
+static int drop_privileges(pam_handle_t *pamh, const char *username, int uid,
+                           int *old_uid, int *old_gid) {
+  // Try to become the new user. This might be necessary for NFS mounted home
+  // directories.
+
+  // First, look up the user's default group
+  #ifdef _SC_GETPW_R_SIZE_MAX
+  int len = sysconf(_SC_GETPW_R_SIZE_MAX);
+  if (len <= 0) {
+    len = 4096;
+  }
+  #else
+  int len = 4096;
+  #endif
+  char *buf = malloc(len);
+  if (!buf) {
+    log_message(LOG_ERR, pamh, "Out of memory");
+    return -1;
+  }
+  struct passwd pwbuf, *pw;
+  if (getpwuid_r(uid, &pwbuf, buf, len, &pw) || !pw) {
+    log_message(LOG_ERR, pamh, "Cannot look up user id %d", uid);
+    free(buf);
+    return -1;
+  }
+  gid_t gid = pw->pw_gid;
+  free(buf);
+
+  int gid_o = setgroup(gid);
+  int uid_o = setuser(uid);
+  if (uid_o < 0) {
+    if (gid_o >= 0) {
+      if (setgroup(gid_o) < 0 || setgroup(gid_o) != gid_o) {
+        // Inform the caller that we were unsuccessful in resetting the group.
+        *old_gid = gid_o;
+      }
+    }
+    log_message(LOG_ERR, pamh, "Failed to change user id to \"%s\"",
+                username);
+    return -1;
+  }
+  if (gid_o < 0 && (gid_o = setgroup(gid)) < 0) {
+    // In most typical use cases, the PAM module will end up being called
+    // while uid=0. This allows the module to change to an arbitrary group
+    // prior to changing the uid. But there are many ways that PAM modules
+    // can be invoked and in some scenarios this might not work. So, we also
+    // try changing the group _after_ changing the uid. It might just work.
+    if (setuser(uid_o) < 0 || setuser(uid_o) != uid_o) {
+      // Inform the caller that we were unsuccessful in resetting the uid.
+      *old_uid = uid_o;
+    }
+    log_message(LOG_ERR, pamh,
+                "Failed to change group id for user \"%s\" to %d", username,
+                (int)gid);
+    return -1;
+  }
+
+  *old_uid = uid_o;
+  *old_gid = gid_o;
+  return 0;
+}
+
+// open secret file, return fd on success, or <0 on error.
+static int open_secret_file(pam_handle_t *pamh, const char *secret_filename,
+                            struct Params *params, const char *username,
+                            int uid, struct stat *orig_stat) {
+  // Try to open "pamshi config"
+  const int fd = open(secret_filename, O_RDONLY);
+  if (fd < 0 ||
+      fstat(fd, orig_stat) < 0) {
+    if (params->nullok != NULLERR && errno == ENOENT) {
+      // The user doesn't have a state file, but the administrator said
+      // that this is OK. We still return an error from open_secret_file(),
+      // but we remember that this was the result of a missing state file.
+      params->nullok = SECRETNOTFOUND;
+    } else {
+      log_message(LOG_ERR, pamh, "Failed to read \"%s\" for \"%s\": %s",
+                  secret_filename, username, strerror(errno));
+    }
+ error:
+    if (fd >= 0) {
+      close(fd);
+    }
+    return -1;
+  }
+
+  if (params->debug) {
+    log_message(LOG_INFO, pamh,
+                "debug: Secret file permissions are %04o."
+                " Allowed permissions are %04o",
+                orig_stat->st_mode & 03777, params->allowed_perm);
+  }
+
+  // Check permissions on "pamshi config".
+  if (!S_ISREG(orig_stat->st_mode)) {
+    log_message(LOG_ERR, pamh, "Secret file \"%s\" is not a regular file",
+                secret_filename);
+    goto error;
+  }
+  if (orig_stat->st_mode & 03777 & ~params->allowed_perm) {
+    log_message(LOG_ERR, pamh,
+                "Secret file \"%s\" permissions (%04o)"
+                " are more permissive than %04o", secret_filename,
+                orig_stat->st_mode & 03777, params->allowed_perm);
+    goto error;
+  }
+
+  if (!params->no_strict_owner && (orig_stat->st_uid != (uid_t)uid)) {
+    char buf[80];
+    if (params->fixed_uid) {
+      snprintf(buf, sizeof buf, "user id %d", params->uid);
+      username = buf;
+    }
+    log_message(LOG_ERR, pamh,
+                "Secret file \"%s\" must be owned by \"%s\"",
+                secret_filename, username);
+    goto error;
+  }
+
+  // Sanity check for file length
+  if (orig_stat->st_size < 1 || orig_stat->st_size > 64*1024) {
+    log_message(LOG_ERR, pamh,
+                "Invalid file size for \"%s\"", secret_filename);
+    goto error;
+  }
+
+  return fd;
+}
+
+
+// Read secret file contents.
+// If there's an error the file is closed, NULL is returned, and errno set.
+static char *read_file_contents(pam_handle_t *pamh,
+                                const Params *params,
+                                const char *secret_filename, int *fd,
+                                off_t filesize) {
+  // Arbitrary limit to prevent integer overflow.
+  if (filesize > 1000000) {
+    close(*fd);
+    errno = E2BIG;
+    return NULL;
+  }
+
+  // Read file contents
+  char *buf = malloc(filesize + 1);
+  if (!buf) {
+    log_message(LOG_ERR, pamh, "Failed to malloc %d+1", filesize);
+    goto out;
+  }
+
+  if (filesize != read(*fd, buf, filesize)) {
+    log_message(LOG_ERR, pamh, "Could not read \"%s\"", secret_filename);
+    goto out;
+  }
+  close(*fd);
+  *fd = -1;
+
+  // The rest of the code assumes that there are no NUL bytes in the file.
+  if (memchr(buf, 0, filesize)) {
+    log_message(LOG_ERR, pamh, "Invalid file contents in \"%s\"",
+                secret_filename);
+    goto out;
+  }
+
+  // Terminate the buffer with a NUL byte.
+  buf[filesize] = '\000';
+
+  if(params->debug) {
+    log_message(LOG_INFO, pamh, "debug: \"%s\" read", secret_filename);
+  }
+  return buf;
+
+out:
+  // If we have any data, erase it.
+  if (buf) {
+    explicit_bzero(buf, filesize);
+  }
+  free(buf);
+  if (*fd >= 0) {
+    close(*fd);
+    *fd = -1;
+  }
+  return NULL;
+}
+
+
+// Wrap write() making sure that partial writes don't break everything.
+// Return 0 on success, errno otherwise.
+static int
+full_write(int fd, const char* buf, size_t len) {
+  const char* p = buf;
+  int errors = 0;
+  for (;;) {
+    const ssize_t left = len - (p - buf);
+    const ssize_t rc = write(fd, p, left);
+    if (rc == left) {
+      return 0;
+    }
+    if (rc < 0) {
+      switch (errno) {
+      case EAGAIN:
+      case EINTR:
+        if (errors++ < 3) {
+          continue;
+        }
+      }
+      return errno;
+    }
+    p += rc;
+  }
+}
+
+// Safely overwrite the old secret file.
+// Return 0 on success, errno otherwise.
+static int write_file_contents(pam_handle_t *pamh,
+                               const Params *params,
+                               const char *secret_filename,
+                               struct stat *orig_stat,
+                               const char *buf) {
+  int err = 0;
+  int fd = -1;
+  const size_t fnlength = strlen(secret_filename) + 1 + 6 + 1;
+
+  char *tmp_filename = malloc(fnlength);
+  if (tmp_filename == NULL) {
+    err = errno;
+    goto cleanup;
+  }
+
+  if (fnlength - 1 != snprintf(tmp_filename, fnlength,
+                               "%s~XXXXXX", secret_filename)) {
+    err = ERANGE;
+    goto cleanup;
+  }
+  const mode_t old_mask = umask(077);
+  fd = mkstemp(tmp_filename);
+  umask(old_mask);
+  if (fd < 0) {
+    err = errno;
+    log_message(LOG_ERR, pamh, "Failed to create tempfile \"%s\": %s",
+                tmp_filename, strerror(err));
+
+    // Couldn't open file; don't try to delete it later.
+    free(tmp_filename);
+    tmp_filename = NULL;
+    goto cleanup;
+  }
+  if (fchmod(fd, 0400)) {
+    err = errno;
+    goto cleanup;
+  }
+
+  // Make sure the secret file is still the same. This prevents attackers
+  // from opening a lot of pending sessions and then reusing the same
+  // scratch code multiple times.
+  //
+  // (except for the brief race condition between this stat and the
+  // `rename` below)
+  {
+    struct stat sb;
+    if (stat(secret_filename, &sb) != 0) {
+      err = errno;
+      log_message(LOG_ERR, pamh, "stat(): %s", strerror(err));
+      goto cleanup;
+    }
+
+    if (sb.st_ino != orig_stat->st_ino ||
+        sb.st_size != orig_stat->st_size ||
+        sb.st_mtime != orig_stat->st_mtime) {
+      err = EAGAIN;
+      log_message(LOG_ERR, pamh,
+                  "Secret file \"%s\" changed while trying to use "
+                  "scratch code\n", secret_filename);
+      goto cleanup;
+    }
+  }
+
+  // Write the new file contents.
+  if ((err = full_write(fd, buf, strlen(buf)))) {
+    log_message(LOG_ERR, pamh, "write(): %s", strerror(err));
+    goto cleanup;
+  }
+  if (fsync(fd)) {
+    err = errno;
+    log_message(LOG_ERR, pamh, "fsync(): %s", strerror(err));
+    goto cleanup;
+  }
+  if (close(fd)) {
+    err = errno;
+    log_message(LOG_ERR, pamh, "close(): %s", strerror(err));
+    goto cleanup;
+  }
+  fd = -1; // Prevent double-close.
+
+  // Double-check that the file size is correct.
+  {
+    struct stat st;
+    if (stat(tmp_filename, &st)) {
+      err = errno;
+      log_message(LOG_ERR, pamh, "stat(%s): %s", tmp_filename, strerror(err));
+      goto cleanup;
+    }
+    const off_t want = strlen(buf);
+    if (st.st_size == 0 || (want != st.st_size)) {
+      err = EAGAIN;
+      log_message(LOG_ERR, pamh, "temp file size %d. Should be non-zero and %d", st.st_size, want);
+      goto cleanup;
+    }
+  }
+  
+  if (rename(tmp_filename, secret_filename) != 0) {
+    err = errno;
+    log_message(LOG_ERR, pamh, "rename(): %s", strerror(err));
+    goto cleanup;
+  }
+  free(tmp_filename);
+  tmp_filename = NULL; // Prevent unlink & double-free.
+
+  if (params->debug) {
+    log_message(LOG_INFO, pamh, "debug: \"%s\" written", secret_filename);
+  }
+
+cleanup:
+  if (fd >= 0) {
+    close(fd);
+  }
+  if (tmp_filename) {
+    if (unlink(tmp_filename)) {
+      log_message(LOG_ERR, pamh, "Failed to delete tempfile \"%s\": %s",
+                  tmp_filename, strerror(errno));
+    }
+  }
+  free(tmp_filename);
+
+  if (err) {
+    log_message(LOG_ERR, pamh, "Failed to update secret file \"%s\": %s",
+                secret_filename, strerror(err));
+    return err;
+  }
+  return 0;
+}
+
+// given secret file content (buf), extract the secret and base32 decode it.
+//
+// Return pointer to `malloc()`'d secret on success (caller frees),
+// NULL on error. Length of secret stored in *secretLen.
+static uint8_t *get_shared_secret(pam_handle_t *pamh,
+                                  const Params *params,
+                                  const char *secret_filename,
+                                  const char *buf, int *secretLen) {
+  if (!buf) {
+    return NULL;
+  }
+  // Decode secret key
+  const int base32Len = strcspn(buf, "\n");
+
+  // Arbitrary limit to prevent integer overflow.
+  if (base32Len > 100000) {
+    return NULL;
+  }
+
+  *secretLen = (base32Len*5 + 7)/8;
+  uint8_t *secret = malloc(base32Len + 1);
+  if (secret == NULL) {
+    *secretLen = 0;
+    return NULL;
+  }
+  memcpy(secret, buf, base32Len);
+  secret[base32Len] = '\000';
+  if ((*secretLen = base32_decode(secret, secret, base32Len)) < 1) {
+    log_message(LOG_ERR, pamh,
+                "Could not find a valid BASE32 encoded secret in \"%s\"",
+                secret_filename);
+    explicit_bzero(secret, base32Len);
+    free(secret);
+    return NULL;
+  }
+  memset(secret + *secretLen, 0, base32Len + 1 - *secretLen);
+
+  if(params->debug) {
+    log_message(LOG_INFO, pamh, "debug: shared secret in \"%s\" processed", secret_filename);
+  }
+  return secret;
+}
+
+
+static int rate_limit(pam_handle_t *pamh, const char *secret_filename,
+                      int *updated, char **buf) {
+  const char *value = get_cfg_value(pamh, "RATE_LIMIT", *buf);
+  if (!value) {
+    // Rate limiting is not enabled for this account
+    return 0;
+  } else if (value == &oom) {
+    // Out of memory. This is a fatal error.
+    return -1;
+  }
+
+  // Parse both the maximum number of login attempts and the time interval
+  // that we are looking at.
+  const char *endptr = value, *ptr;
+  int attempts, interval;
+  errno = 0;
+  if (((attempts = (int)strtoul(ptr = endptr, (char **)&endptr, 10)) < 1) ||
+      ptr == endptr ||
+      attempts > 100 ||
+      errno ||
+      (*endptr != ' ' && *endptr != '\t') ||
+      ((interval = (int)strtoul(ptr = endptr, (char **)&endptr, 10)) < 1) ||
+      ptr == endptr ||
+      interval > 3600 ||
+      errno) {
+    free((void *)value);
+    log_message(LOG_ERR, pamh, "Invalid RATE_LIMIT option. Check \"%s\".",
+                secret_filename);
+    return -1;
+  }
+
+  // Parse the time stamps of all previous login attempts.
+  const unsigned int now = get_time();
+  unsigned int *timestamps = malloc(sizeof(int));
+  if (!timestamps) {
+  oom:
+    free((void *)value);
+    log_message(LOG_ERR, pamh, "Out of memory");
+    return -1;
+  }
+  timestamps[0] = now;
+  int num_timestamps = 1;
+  while (*endptr && *endptr != '\r' && *endptr != '\n') {
+    unsigned int timestamp;
+    errno = 0;
+    if ((*endptr != ' ' && *endptr != '\t') ||
+        ((timestamp = (int)strtoul(ptr = endptr, (char **)&endptr, 10)),
+         errno) ||
+        ptr == endptr) {
+      free((void *)value);
+      free(timestamps);
+      log_message(LOG_ERR, pamh, "Invalid list of timestamps in RATE_LIMIT. "
+                  "Check \"%s\".", secret_filename);
+      return -1;
+    }
+    num_timestamps++;
+    unsigned int *tmp = (unsigned int *)realloc(timestamps,
+                                                sizeof(int) * num_timestamps);
+    if (!tmp) {
+      free(timestamps);
+      goto oom;
+    }
+    timestamps = tmp;
+    timestamps[num_timestamps-1] = timestamp;
+  }
+  free((void *)value);
+  value = NULL;
+
+  // Sort time stamps, then prune all entries outside of the current time
+  // interval.
+  qsort(timestamps, num_timestamps, sizeof(int), comparator);
+  int start = 0, stop = -1;
+  for (int i = 0; i < num_timestamps; ++i) {
+    if (timestamps[i] < now - interval) {
+      start = i+1;
+    } else if (timestamps[i] > now) {
+      break;
+    }
+    stop = i;
+  }
+
+  // Error out, if there are too many login attempts.
+  int exceeded = 0;
+  if (stop - start + 1 > attempts) {
+    exceeded = 1;
+    start = stop - attempts + 1;
+  }
+
+  // Construct new list of timestamps within the current time interval.
+  char* list;
+  {
+    const size_t list_size = 25 * (2 + (stop - start + 1)) + 4;
+    list = malloc(list_size);
+    if (!list) {
+      free(timestamps);
+      goto oom;
+    }
+    snprintf(list, list_size, "%d %d", attempts, interval);
+    char *prnt = strchr(list, '\000');
+    for (int i = start; i <= stop; ++i) {
+      prnt += snprintf(prnt, list_size-(prnt-list), " %u", timestamps[i]);
+    }
+    free(timestamps);
+  }
+
+  // Try to update RATE_LIMIT line.
+  if (set_cfg_value(pamh, "RATE_LIMIT", list, buf) < 0) {
+    free(list);
+    return -1;
+  }
+  free(list);
+
+  // Mark the state file as changed.
+  *updated = 1;
+
+  // If necessary, notify the user of the rate limiting that is in effect.
+  if (exceeded) {
+    log_message(LOG_ERR, pamh,
+                "Too many concurrent login attempts (\"%s\"). Please try again.", secret_filename);
+    return -1;
+  }
+
+  return 0;
+}
+
+
+// Show error message to the user.
+static void
+conv_error(pam_handle_t *pamh, const char* text) {
+  PAM_CONST struct pam_message msg = {
+    .msg_style = PAM_ERROR_MSG,
+    .msg       = text,
+  };
+  PAM_CONST struct pam_message *msgs = &msg;
+  struct pam_response *resp = NULL;
+  const int retval = converse(pamh, 1, &msgs, &resp);
+  if (retval != PAM_SUCCESS) {
+    log_message(LOG_ERR, pamh, "Failed to inform user of error");
+  }
+  free(resp);
+}
+
+/*
+ * Return non-zero if the last login from the same host as this one was
+ * successfully authenticated within the grace period.
+ */
+int within_grace_period(pam_handle_t *pamh, const Params *params,
+                    const char *buf) {
+  const char *rhost = get_rhost(pamh, params);
+  const time_t now = get_time();
+  const time_t grace = params->grace_period;
+  unsigned long when = 0;
+  char match[128];
+
+  if (rhost == NULL) {
+    return 0;
+  }
+  snprintf(match, sizeof match, " %s %%lu ", rhost);
+
+  for (int i = 0; i < 10; i++) {
+    static char name[] = "LAST0";
+    name[4] = i + '0';
+    char* line = get_cfg_value(pamh, name, buf);
+
+    if (line == &oom) {
+      /* Fatal! */
+      return 0;
+    }
+    if (!line) {
+      continue;
+    }
+    if (sscanf(line, match, &when) == 1) {
+      free(line);
+      break;
+    }
+    free(line);
+  }
+
+  if (when == 0) {
+    /* No match */
+    return 0;
+  }
+
+  return (when + grace > now);
+}
+
 static int parse_user(pam_handle_t *pamh, const char *name, uid_t *uid){
 	char * endptr;
 	errno = 0;
@@ -164,7 +883,7 @@ static int parse_user(pam_handle_t *pamh, const char *name, uid_t *uid){
 	return 0;
 }
 
-	static int parse_args(pam_handle_t *pamh, int argc, const char **argv,
+static int parse_args(pam_handle_t *pamh, int argc, const char **argv,
  					Params *params) {
 	params->debug = 0;
 	params->echocode = PAM_PROMPT_ECHO_OFF;
@@ -195,16 +914,8 @@ static int parse_user(pam_handle_t *pamh, const char *name, uid_t *uid){
 			params->no_strict_owner = 1;
 		} else if (!strcmp(argv[i], "debug")) {
 			params->debug = 1;
-		} else if (!strcmp(argv[i], "try_first_pass")) {
-			params->pass_mode = TRY_FIRST_PASS;
-		} else if (!strcmp(argv[i], "use_first_pass")) {
-			params->pass_mode = USE_FIRST_PASS;
-		} else if (!strcmp(argv[i], "forward_pass")) {
-			params->forward_pass = 1;
 		} else if (!strcmp(argv[i], "nullok")) {
 			params->nullok = NULLOK;
-		} else if (!strcmp(argv[i], "echo_verification_code")) {
-			params->echocode = PAM_PROMPT_ECHO_ON;
 		} else if (!strncmp(argv[i], "graceperiod=", 13)){
 			char *remainder = NULL;
 			const time_t grace = (time_t)strtol(argv[i]+13, &remainder, 10);
@@ -223,6 +934,41 @@ static int parse_user(pam_handle_t *pamh, const char *name, uid_t *uid){
 	}
 	return 0;
 }
+
+static CURLcode perform_device_authorization(CURL *curl, const char *url, const char *client_id, const char *scope) {
+    CURLcode res = CURLE_FAILED_INIT;
+
+    if (curl) {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "POST");
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_DEFAULT_PROTOCOL, "https");
+
+        struct curl_slist *headers = NULL;
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+        curl_mime *mime = curl_mime_init(curl);
+        curl_mimepart *part;
+
+        part = curl_mime_addpart(mime);
+        curl_mime_name(part, "client_id");
+        curl_mime_data(part, client_id, CURL_ZERO_TERMINATED);
+
+        part = curl_mime_addpart(mime);
+        curl_mime_name(part, "scope");
+        curl_mime_data(part, scope, CURL_ZERO_TERMINATED);
+
+        curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
+
+        res = curl_easy_perform(curl);
+
+        curl_mime_free(mime);
+        curl_slist_free_all(headers);
+    }
+
+    return res;
+}
+
 PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags UNUSED_ATTR,
 				   int argc, const char **argv) {
 	int rc = PAM_AUTH_ERR;
@@ -262,7 +1008,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags UNUSED_ATTR,
 			}
 		}
 		
-		if(drop_priviliges(pamh, drop_username, uid, &old_uid, &old_gid)) {
+		if(drop_privileges(pamh, drop_username, uid, &old_uid, &old_gid)) {
 			goto out;
 		}
 	}
@@ -281,7 +1027,87 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags UNUSED_ATTR,
 			}
 		}
 	}
-	return PAM_SUCCESS;
+
+	/*
+	* Check to see if a successful login from the same host happened
+	* within the grace period. If it did, then allow login without
+	* an additional code.
+	*/
+	if (buf && within_grace_period(pamh, &params, buf)) {
+		rc = PAM_SUCCESS;
+		log_message(LOG_INFO, pamh,
+					"within grace period: \"%s\"", username);
+		goto out;
+	}
+
+	// If the user has not created a state file with a shared secret, and if
+	// the administrator set the "nullok" option, this PAM module completes
+	// without saying success or failure, without ever prompting the user.
+	// It's not a failure since "nullok" was specified, and it's not a success
+	// because it must be distinguishable from "good credentials given" in
+	// case the PAM config considers this module "sufficient".
+	// (or more complex equivalents)
+	if (params.nullok == SECRETNOTFOUND) {
+	rc = PAM_IGNORE;
+	}
+
+	// Persist the new state.
+	if (early_updated || updated) {
+	int err;
+	if ((err = write_file_contents(pamh, &params, secret_filename, &orig_stat, buf))) {
+		// Inform user of error if the error is clearly a system error
+		// and not an auth error.
+		char s[1024];
+		switch (err) {
+		case EPERM:
+		case ENOSPC:
+		case EROFS:
+		case EIO:
+		case EDQUOT:
+		snprintf(s, sizeof(s), "Error \"%s\" while writing config", strerror(err));
+		conv_error(pamh, s);
+		}
+
+		// If allow_readonly parameter is defined than ignore write errors and
+		// allow user to login.
+
+		// Could not persist new state. Deny access.
+		rc = PAM_AUTH_ERR;
+	}
+	}
+
+	out:
+	if (params.debug) {
+		log_message(LOG_INFO, pamh,
+					"debug: end of google_authenticator for \"%s\". Result: %s",
+					username, pam_strerror(pamh, rc));
+	}
+	if (fd >= 0) {
+		close(fd);
+	}
+	if (old_gid >= 0) {
+		if (setgroup(old_gid) >= 0 && setgroup(old_gid) == old_gid) {
+		old_gid = -1;
+		}
+	}
+	if (old_uid >= 0) {
+		if (setuser(old_uid) < 0 || setuser(old_uid) != old_uid) {
+		log_message(LOG_EMERG, pamh, "We switched users from %d to %d, "
+					"but can't switch back", old_uid, uid);
+		}
+	}
+	free(secret_filename);
+
+	// Clean up
+	if (buf) {
+		explicit_bzero(buf, strlen(buf));
+		free(buf);
+	}
+	if (secret) {
+		explicit_bzero(secret, secretLen);
+		free(secret);
+	}
+	return rc;
 }
 
 PAM_EXTERN int pam_sm_setcred (pam_handle_t *pamh UNUSED_ATTR,
