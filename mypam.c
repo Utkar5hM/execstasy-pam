@@ -26,12 +26,13 @@
 #define MODULE_NAME   "pamshi_auth"
 
 #define SECRET	"/etc/pamshi/.config"
-#define CODE_PROMPT "Verification code: "
-#define PWCODE_PROMPT "Password & verification code: "
-
+#define PROMPT "Enter the following Code or scan the URL with your authenticator app: "
+#define DEVICE_AUTHORIZATION_ENDPOINT "/oauth/device_authorization"
 typedef struct Params{
 	const char* secret_filename_spec;
-	const char *authtok_prompt;
+	const char * authtok_prompt;
+  const char * auth_server_url;
+  const char * username;
 	enum { NULLERR=0, NULLOK, SECRETNOTFOUND } nullok;
 	int debug;
 	int echocode;
@@ -323,7 +324,6 @@ static int drop_privileges(pam_handle_t *pamh, const char *username, int uid,
   }
   gid_t gid = pw->pw_gid;
   free(buf);
-
   int gid_o = setgroup(gid);
   int uid_o = setuser(uid);
   if (uid_o < 0) {
@@ -333,6 +333,10 @@ static int drop_privileges(pam_handle_t *pamh, const char *username, int uid,
         *old_gid = gid_o;
       }
     }
+
+    log_message(LOG_ERR, pamh, "gid_o: %d uid_o: %d", gid_o, uid_o);
+    log_message(LOG_ERR, pamh, "gid: %d uid: %d", gid, uid);
+
     log_message(LOG_ERR, pamh, "Failed to change user id to \"%s\"",
                 username);
     return -1;
@@ -957,6 +961,36 @@ conv_error(pam_handle_t *pamh, const char* text) {
   free(resp);
 }
 
+static char *request_pass(pam_handle_t *pamh, int echocode,
+                          PAM_CONST char *prompt) {
+  // Query user for verification code
+  PAM_CONST struct pam_message msg = { .msg_style = echocode,
+                                   .msg       = prompt };
+  PAM_CONST struct pam_message *msgs = &msg;
+  struct pam_response *resp = NULL;
+  int retval = converse(pamh, 1, &msgs, &resp);
+  char *ret = NULL;
+  if (retval != PAM_SUCCESS || resp == NULL || resp->resp == NULL ||
+      *resp->resp == '\000') {
+    log_message(LOG_ERR, pamh, "Did not receive verification code from user");
+    if (retval == PAM_SUCCESS && resp && resp->resp) {
+      ret = resp->resp;
+    }
+  } else {
+    ret = resp->resp;
+  }
+
+  // Deallocate temporary storage
+  if (resp) {
+    if (!ret) {
+      free(resp->resp);
+    }
+    free(resp);
+  }
+
+  return ret;
+}
+
 /*
  * Return non-zero if the last login from the same host as this one was
  * successfully authenticated within the grace period.
@@ -968,7 +1002,6 @@ int within_grace_period(pam_handle_t *pamh, const Params *params,
   const time_t grace = params->grace_period;
   unsigned long when = 0;
   char match[128];
-
   if (rhost == NULL) {
     return 0;
   }
@@ -1035,6 +1068,8 @@ static int parse_args(pam_handle_t *pamh, int argc, const char **argv,
 			params->secret_filename_spec = argv[i] +7;
 		} else if (!strncmp(argv[i], "authtok_prompt=", 15)) {
 			params->authtok_prompt = argv[i] + 15;
+    } else if (!strncmp(argv[i], "auth_server_url=", 16)) {
+      params->auth_server_url = argv[i] + 16;
 		} else if (!strncmp(argv[i], "user=",  5)) {
 			uid_t uid;
 			if (parse_user(pamh, argv[i] +5, &uid) < 0 ) {
@@ -1042,6 +1077,7 @@ static int parse_args(pam_handle_t *pamh, int argc, const char **argv,
 			}
 			params->fixed_uid = 1;
 			params->uid = uid;
+      params->username = argv[i] + 5;
 		} else if (!strncmp(argv[i], "allowed_perm=", 13)) {
 			char *remainder = NULL;
 			const int perm = (int)strtol(argv[i] + 13, &remainder, 8);
@@ -1078,9 +1114,16 @@ static int parse_args(pam_handle_t *pamh, int argc, const char **argv,
 	return 0;
 }
 
-static CURLcode perform_device_authorization(CURL *curl, const char *url, const char *client_id, const char *scope) {
+static CURLcode perform_device_authorization(pam_handle_t *pamh, CURL *curl, Params *params, const char *client_id, const char *scope) {
     CURLcode res = CURLE_FAILED_INIT;
 
+    // Allocate and build the full URL
+    size_t url_len = strlen(params->auth_server_url) + strlen(DEVICE_AUTHORIZATION_ENDPOINT) + 1;
+    char *url = malloc(url_len);
+    if (!url) {
+        return CURLE_OUT_OF_MEMORY;
+    }
+    snprintf(url, url_len, "%s%s", params->auth_server_url, DEVICE_AUTHORIZATION_ENDPOINT);
     if (curl) {
         curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "POST");
         curl_easy_setopt(curl, CURLOPT_URL, url);
@@ -1109,6 +1152,7 @@ static CURLcode perform_device_authorization(CURL *curl, const char *url, const 
         curl_slist_free_all(headers);
     }
 
+    free(url);
     return res;
 }
 
@@ -1130,31 +1174,34 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags UNUSED_ATTR,
 	}
 	
 	const char *prompt = params.authtok_prompt ? 
-		params.authtok_prompt : (params.forward_pass ? PWCODE_PROMPT : CODE_PROMPT );
+		params.authtok_prompt : PROMPT;
 
 	int early_updated = 0, updated = 0;
-
 	const char* const username = get_user_name(pamh, &params);
 	char* const secret_filename = get_secret_filename(pamh, &params,
 						   username, &uid);
 	int stopped_by_rate_limit = 0;
 
-	// drop privs
-	{ 
-		const char* drop_username = username;
 
-		// if user doesn't exist, use 'nobody'.
-		if (uid == -1) {
-			drop_username = nobody;
-			if (parse_user(pamh, drop_username, &uid)) {
-				goto out;
-			}
-		}
+	// // drop privs
+	// { 
+    
+	// 	const char* drop_username = username;
+  //   if(params.fixed_uid){
+  //     drop_username = params.username;
+  //   }
+	// 	// if user doesn't exist, use 'nobody'.
+	// 	if (uid == -1) {
+	// 		drop_username = nobody;
+	// 		if (parse_user(pamh, drop_username, &uid)) {
+	// 			goto out;
+	// 		}
+	// 	}
 		
-		if(drop_privileges(pamh, drop_username, uid, &old_uid, &old_gid)) {
-			goto out;
-		}
-	}
+	// 	if(drop_privileges(pamh, drop_username, uid, &old_uid, &old_gid)) {
+	// 		goto out;
+	// 	}
+	// }
 
 	if(secret_filename) {
 		fd = open_secret_file(pamh, secret_filename, &params, username, uid, &orig_stat);
@@ -1183,6 +1230,19 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags UNUSED_ATTR,
 		goto out;
 	}
 
+  if (secret){
+      CURL *curl = curl_easy_init();
+      CURLcode res = CURLE_FAILED_INIT;
+      const char *scope = "user:user";
+      for (int mode = 0; mode < 3; mode++) {
+          res = perform_device_authorization(pamh, curl, &params, secret, scope);
+          if (res == CURLE_OK) {
+            break;
+          }
+      }
+  }
+  char *saved_pw = NULL;
+  // saved_pw = request_pass(pamh, params.echocode, prompt);
 	// If the user has not created a state file with a shared secret, and if
 	// the administrator set the "nullok" option, this PAM module completes
 	// without saying success or failure, without ever prompting the user.

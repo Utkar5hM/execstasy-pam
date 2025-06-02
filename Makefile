@@ -1,7 +1,7 @@
 install:
-	gcc -fPIC -c mypam.c base32.c -I.;
-	gcc -shared -o mypam.so mypam.o base32.o -lpam;
+	gcc -fPIC -c mypam.c base32.c base32_prog.c -I.;
+	gcc -shared -o mypam.so mypam.o base32.o base32_prog.o -lpam  -lcurl;
 	sudo cp mypam.so /lib64/security/mypam.so
 
 test: install
-	pamtester -v pamtester user authenticate
+	sudo pamtester -v pamtester user authenticate
