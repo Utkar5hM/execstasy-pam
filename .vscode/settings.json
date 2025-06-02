@@ -1,7 +1,0 @@
-{
-    "files.associations": {
-        "curl.h": "c",
-        "stdio.h": "c",
-        "fcntl.h": "c"
-    }
-}

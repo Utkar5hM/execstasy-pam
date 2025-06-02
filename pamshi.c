@@ -16,7 +16,8 @@
 #include <config.h>
 #include <curl/curl.h>
 #include "base32.h"
-
+#include "cJSON.h"
+#include "qrcode.h"
 #ifdef HAVE_SYS_FSUID_H
 // We much rather prefer to use setfsuid(), but this function is unfortunately
 // not available on all systems.
@@ -1114,7 +1115,25 @@ static int parse_args(pam_handle_t *pamh, int argc, const char **argv,
 	return 0;
 }
 
-static CURLcode perform_device_authorization(pam_handle_t *pamh, CURL *curl, Params *params, const char *client_id, const char *scope) {
+// Callback function to capture the response data
+static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t total_size = size * nmemb;
+    char **response_ptr = (char **)userp;
+
+    // Reallocate memory to append the new data
+    char *temp = realloc(*response_ptr, strlen(*response_ptr) + total_size + 1);
+    if (!temp) {
+        return 0; // Memory allocation failed
+    }
+
+    *response_ptr = temp;
+    strncat(*response_ptr, (char *)contents, total_size);
+
+    return total_size;
+}
+
+
+static CURLcode perform_device_authorization(pam_handle_t *pamh, CURL *curl, Params *params, const char *client_id, const char *scope, char** output) {
     CURLcode res = CURLE_FAILED_INIT;
 
     // Allocate and build the full URL
@@ -1124,6 +1143,13 @@ static CURLcode perform_device_authorization(pam_handle_t *pamh, CURL *curl, Par
         return CURLE_OUT_OF_MEMORY;
     }
     snprintf(url, url_len, "%s%s", params->auth_server_url, DEVICE_AUTHORIZATION_ENDPOINT);
+    // Initialize response buffer
+    *output = calloc(1, sizeof(char)); // Start with an empty string
+    if (!output) {
+        free(url);
+        return CURLE_OUT_OF_MEMORY;
+    }
+
     if (curl) {
         curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "POST");
         curl_easy_setopt(curl, CURLOPT_URL, url);
@@ -1146,14 +1172,90 @@ static CURLcode perform_device_authorization(pam_handle_t *pamh, CURL *curl, Par
 
         curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
 
-        res = curl_easy_perform(curl);
+        // Set the callback function to capture the response
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, output);
 
+        res = curl_easy_perform(curl);
         curl_mime_free(mime);
         curl_slist_free_all(headers);
     }
-
+    if (res != CURLE_OK) {
+        free(output); 
+        output = NULL;
+    }
     free(url);
     return res;
+}
+
+
+static int parse_json_response(pam_handle_t *pamh, const char *response, char **device_code,
+      char **user_code, char **verification_uri, char **verification_uri_complete, int *expires_in, int *interval) {
+    cJSON *json = cJSON_Parse(response);
+    if (!json) {
+        log_message(LOG_ERR, pamh, "Failed to parse JSON response");
+        return -1;
+    }
+
+    // Extract "device_code"
+    cJSON *device_code_item = cJSON_GetObjectItemCaseSensitive(json, "device_code");
+    if (cJSON_IsString(device_code_item) && (device_code_item->valuestring != NULL)) {
+        *device_code = strdup(device_code_item->valuestring);
+    } else {
+        log_message(LOG_ERR, pamh, "Missing or invalid 'device_code' in JSON");
+        cJSON_Delete(json);
+        return -1;
+    }
+
+    // Extract "user_code"
+    cJSON *user_code_item = cJSON_GetObjectItemCaseSensitive(json, "user_code");
+    if (cJSON_IsString(user_code_item) && (user_code_item->valuestring != NULL)) {
+        *user_code = strdup(user_code_item->valuestring);
+    } else {
+        log_message(LOG_ERR, pamh, "Missing or invalid 'user_code' in JSON");
+        cJSON_Delete(json);
+        return -1;
+    }
+
+    // Extract "verification_uri"
+    cJSON *verification_uri_item = cJSON_GetObjectItemCaseSensitive(json, "verification_uri");
+    if (cJSON_IsString(verification_uri_item) && (verification_uri_item->valuestring != NULL)) {
+        *verification_uri = strdup(verification_uri_item->valuestring);
+    } else {
+        log_message(LOG_ERR, pamh, "Missing or invalid 'verification_uri' in JSON");
+        cJSON_Delete(json);
+        return -1;
+    }
+
+    cJSON *verification_uri_complete_item = cJSON_GetObjectItemCaseSensitive(json, "verification_uri_complete");
+    if (cJSON_IsString(verification_uri_complete_item) && (verification_uri_complete_item->valuestring != NULL)) {
+        *verification_uri_complete = strdup(verification_uri_complete_item->valuestring);
+    } else {
+        log_message(LOG_INFO, pamh, "field 'verification_uri_complete' is missing in JSON");
+        cJSON_Delete(json);
+        return -1;
+    }
+
+    cJSON *expires_in_item = cJSON_GetObjectItemCaseSensitive(json, "expires_in");
+    if (cJSON_IsNumber(expires_in_item)) {
+        *expires_in = expires_in_item->valueint;
+    } else {
+        log_message(LOG_ERR, pamh, "Missing or invalid 'expires_in' in JSON");
+        cJSON_Delete(json);
+        return -1;
+    }
+
+    cJSON *interval_item = cJSON_GetObjectItemCaseSensitive(json, "interval");
+    if (cJSON_IsNumber(interval_item)) {
+        *interval = interval_item->valueint;
+    } else {
+        log_message(LOG_ERR, pamh, "Missing or invalid 'interval' in JSON");
+        cJSON_Delete(json);
+        return -1;
+    }
+
+    cJSON_Delete(json);
+    return 0;
 }
 
 PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags UNUSED_ATTR,
@@ -1234,12 +1336,74 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags UNUSED_ATTR,
       CURL *curl = curl_easy_init();
       CURLcode res = CURLE_FAILED_INIT;
       const char *scope = "user:user";
+      char* output = NULL;
+
       for (int mode = 0; mode < 3; mode++) {
-          res = perform_device_authorization(pamh, curl, &params, secret, scope);
+          res = perform_device_authorization(pamh, curl, &params, secret, scope, &output);
           if (res == CURLE_OK) {
             break;
           }
+          if (mode ==2 ) {
+              goto out;
+          }
       }
+
+      char *device_code = NULL, *user_code = NULL, *verification_uri = NULL, *verification_uri_complete = NULL;
+      int * expires_in = malloc(sizeof(int)), *interval = malloc(sizeof(int));
+      if (!expires_in || !interval) {
+          log_message(LOG_ERR, pamh, "Out of memory");
+          rc = PAM_BUF_ERR;
+          goto out;
+      }
+      if (parse_json_response(pamh, output, &device_code, &user_code, &verification_uri, &verification_uri_complete , expires_in, interval) == 0) {
+          free(output);
+      } else {
+        log_message(LOG_ERR, pamh, "Failed to parse JSON response");
+        goto out;
+      }
+
+      // Dynamically allocate memory for the prompt message
+      static char* qrcode = NULL;
+      enum QRMode qr_mode = QR_UTF8;
+      int qr_gen = displayQRCode(verification_uri_complete, qr_mode, &qrcode);
+      if (qr_gen == 0) {
+          log_message(LOG_ERR, pamh, "Failed to generate QR code %d", qr_gen);
+          goto out;
+      }
+      size_t prompt_len = strlen(verification_uri_complete) + strlen(qrcode) + strlen(user_code) + 200; // Extra space for static text
+
+      char *prompt_message = malloc(prompt_len + 1);
+      if (!prompt_message) {
+          log_message(LOG_ERR, pamh, "Out of memory while creating prompt message");
+          rc = PAM_BUF_ERR;
+          goto out;
+      }
+      // Create the prompt message
+      snprintf(prompt_message, prompt_len,
+              "This Device is protected by Pam Shi(t)\n\e]8;;%s\aClick here\e]8;;\a to authenticate\nor Visit: %s \nAnd enter the user code: %s\nOr Scan the below QR Code:\n%s",
+              verification_uri_complete, verification_uri, user_code, qrcode);
+
+      // Prepare the PAM message
+      struct pam_message msg = {
+          .msg_style = PAM_TEXT_INFO,
+          .msg = prompt_message
+      };
+      struct pam_message *msgp = &msg;
+      struct pam_response *resp = NULL;
+
+      // Use the converse function to display the prompt
+      if (converse(pamh, 1, (PAM_CONST struct pam_message **)&msgp, &resp) != PAM_SUCCESS) {
+          log_message(LOG_ERR, pamh, "Failed to display prompt to user");
+          rc = PAM_CONV_ERR;
+          free(prompt_message);
+          goto out;
+      }
+
+      if (resp) {
+          free(resp); // Free the response if allocated
+      }
+
+      free(prompt_message); // Free the dynamically allocated prompt message
   }
   char *saved_pw = NULL;
   // saved_pw = request_pass(pamh, params.echocode, prompt);
@@ -1282,7 +1446,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags UNUSED_ATTR,
 	out:
 	if (params.debug) {
 		log_message(LOG_INFO, pamh,
-					"debug: end of google_authenticator for \"%s\". Result: %s",
+					"debug: end of pamshi for \"%s\". Result: %s",
 					username, pam_strerror(pamh, rc));
 	}
 	if (fd >= 0) {

@@ -1,7 +1,7 @@
 install:
-	gcc -fPIC -c mypam.c base32.c base32_prog.c -I.;
-	gcc -shared -o mypam.so mypam.o base32.o base32_prog.o -lpam  -lcurl;
-	sudo cp mypam.so /lib64/security/mypam.so
+	gcc -fPIC -c pamshi.c base32.c base32_prog.c cJSON.c qrcode.c -I.;
+	gcc -shared -o pamshi.so pamshi.o base32.o base32_prog.o cJSON.o qrcode.o -lpam  -lcurl;
+	sudo cp pamshi.so /lib64/security/pamshi.so
 
 test: install
 	sudo pamtester -v pamtester user authenticate
