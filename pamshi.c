@@ -335,9 +335,6 @@ static int drop_privileges(pam_handle_t *pamh, const char *username, int uid,
       }
     }
 
-    log_message(LOG_ERR, pamh, "gid_o: %d uid_o: %d", gid_o, uid_o);
-    log_message(LOG_ERR, pamh, "gid: %d uid: %d", gid, uid);
-
     log_message(LOG_ERR, pamh, "Failed to change user id to \"%s\"",
                 username);
     return -1;
@@ -962,36 +959,6 @@ conv_error(pam_handle_t *pamh, const char* text) {
   free(resp);
 }
 
-static char *request_pass(pam_handle_t *pamh, int echocode,
-                          PAM_CONST char *prompt) {
-  // Query user for verification code
-  PAM_CONST struct pam_message msg = { .msg_style = echocode,
-                                   .msg       = prompt };
-  PAM_CONST struct pam_message *msgs = &msg;
-  struct pam_response *resp = NULL;
-  int retval = converse(pamh, 1, &msgs, &resp);
-  char *ret = NULL;
-  if (retval != PAM_SUCCESS || resp == NULL || resp->resp == NULL ||
-      *resp->resp == '\000') {
-    log_message(LOG_ERR, pamh, "Did not receive verification code from user");
-    if (retval == PAM_SUCCESS && resp && resp->resp) {
-      ret = resp->resp;
-    }
-  } else {
-    ret = resp->resp;
-  }
-
-  // Deallocate temporary storage
-  if (resp) {
-    if (!ret) {
-      free(resp->resp);
-    }
-    free(resp);
-  }
-
-  return ret;
-}
-
 /*
  * Return non-zero if the last login from the same host as this one was
  * successfully authenticated within the grace period.
@@ -1285,25 +1252,25 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags UNUSED_ATTR,
 	int stopped_by_rate_limit = 0;
 
 
-	// // drop privs
-	// { 
+	// drop privs
+	{ 
     
-	// 	const char* drop_username = username;
-  //   if(params.fixed_uid){
-  //     drop_username = params.username;
-  //   }
-	// 	// if user doesn't exist, use 'nobody'.
-	// 	if (uid == -1) {
-	// 		drop_username = nobody;
-	// 		if (parse_user(pamh, drop_username, &uid)) {
-	// 			goto out;
-	// 		}
-	// 	}
+		const char* drop_username = username;
+    if(params.fixed_uid){
+      drop_username = params.username;
+    }
+		// if user doesn't exist, use 'nobody'.
+		if (uid == -1) {
+			drop_username = nobody;
+			if (parse_user(pamh, drop_username, &uid)) {
+				goto out;
+			}
+		}
 		
-	// 	if(drop_privileges(pamh, drop_username, uid, &old_uid, &old_gid)) {
-	// 		goto out;
-	// 	}
-	// }
+		if(drop_privileges(pamh, drop_username, uid, &old_uid, &old_gid)) {
+			goto out;
+		}
+	}
 
 	if(secret_filename) {
 		fd = open_secret_file(pamh, secret_filename, &params, username, uid, &orig_stat);
@@ -1372,7 +1339,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags UNUSED_ATTR,
       }
       size_t prompt_len = strlen(verification_uri_complete) + strlen(qrcode) + strlen(user_code) + 200; // Extra space for static text
 
-      char *prompt_message = malloc(prompt_len + 1);
+      char *prompt_message = malloc(prompt_len + 200);
       if (!prompt_message) {
           log_message(LOG_ERR, pamh, "Out of memory while creating prompt message");
           rc = PAM_BUF_ERR;
@@ -1382,10 +1349,10 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags UNUSED_ATTR,
       snprintf(prompt_message, prompt_len,
               "This Device is protected by Pam Shi(t)\n\e]8;;%s\aClick here\e]8;;\a to authenticate\nor Visit: %s \nAnd enter the user code: %s\nOr Scan the below QR Code:\n%s",
               verification_uri_complete, verification_uri, user_code, qrcode);
-
+      free(qrcode);
       // Prepare the PAM message
       struct pam_message msg = {
-          .msg_style = PAM_TEXT_INFO,
+          .msg_style = PAM_PROMPT_ECHO_OFF,
           .msg = prompt_message
       };
       struct pam_message *msgp = &msg;
@@ -1399,14 +1366,16 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags UNUSED_ATTR,
           goto out;
       }
 
+
       if (resp) {
           free(resp); // Free the response if allocated
       }
 
       free(prompt_message); // Free the dynamically allocated prompt message
+      sleep(5);
+      rc = PAM_SUCCESS;
   }
   char *saved_pw = NULL;
-  // saved_pw = request_pass(pamh, params.echocode, prompt);
 	// If the user has not created a state file with a shared secret, and if
 	// the administrator set the "nullok" option, this PAM module completes
 	// without saying success or failure, without ever prompting the user.
