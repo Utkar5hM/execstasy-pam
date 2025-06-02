@@ -103,13 +103,13 @@ int displayQRCode(const char* url, enum QRMode mode, char **buf) {
     // it makes the code much smaller, which is often easier to scan.
     // Unfortunately, many terminal emulators do not display these
     // Unicode characters properly.
-    offset += snprintf(*buf + offset, buf_length - offset, ANSI_BLACKONGREY);
+    // offset += snprintf(*buf + offset, buf_length - offset, ANSI_BLACKONGREY);
     for (int i = 0; i < qrcode->width + 4; ++i) {
         offset += snprintf(*buf + offset, buf_length - offset, " ");
     }
-    offset += snprintf(*buf + offset, buf_length - offset, ANSI_RESET"\n");
+    offset += snprintf(*buf + offset, buf_length - offset, "\n"); // ANSI_RESET"\n"
     for (int y = 0; y < qrcode->width; y += 2) {
-        offset += snprintf(*buf + offset, buf_length - offset, ANSI_BLACKONGREY"  ");
+        // offset += snprintf(*buf + offset, buf_length - offset, ANSI_BLACKONGREY"  ");
         for (int x = 0; x < qrcode->width; ++x) {
         const int top = qrcode->data[y*qrcode->width + x] & 1;
         int bottom = 0;
@@ -130,13 +130,13 @@ int displayQRCode(const char* url, enum QRMode mode, char **buf) {
             }
         }
         }
-        offset += snprintf(*buf + offset, buf_length - offset, "  "ANSI_RESET"\n");
+        offset += snprintf(*buf + offset, buf_length - offset, "  ""\n"); //"  "ANSI_RESET"\n"
     }
-    offset += snprintf(*buf + offset, buf_length - offset, ANSI_BLACKONGREY);
+    // offset += snprintf(*buf + offset, buf_length - offset, ANSI_BLACKONGREY);
     for (int i = 0; i < qrcode->width + 4; ++i) {
         offset += snprintf(*buf + offset, buf_length - offset, " ");
     }
-    offset += snprintf(*buf + offset, buf_length - offset, ANSI_RESET);
+    // offset += snprintf(*buf + offset, buf_length - offset, ANSI_RESET);
     }
     offset += snprintf(*buf + offset, buf_length - offset, "\n\000");
     QRcode_free(qrcode);
