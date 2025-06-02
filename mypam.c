@@ -72,6 +72,16 @@ static void log_message(int priority, pam_handle_t *pamh,
 	return;
 }
 
+static int converse(pam_handle_t *pamh, int nargs,
+                    PAM_CONST struct pam_message **message,
+                    struct pam_response **response) {
+  struct pam_conv *conv;
+  int retval = pam_get_item(pamh, PAM_CONV, (void *)&conv);
+  if (retval != PAM_SUCCESS) {
+    return retval;
+  }
+  return conv->conv(nargs, message, response, conv->appdata_ptr);
+}
 
 static const char* get_user_name(pam_handle_t *pamh, const Params *params){
 	const char* username;
@@ -671,6 +681,139 @@ static uint8_t *get_shared_secret(pam_handle_t *pamh,
   return secret;
 }
 
+
+#ifdef TESTING
+static time_t current_time;
+void set_time(time_t t) __attribute__((visibility("default")));
+void set_time(time_t t) {
+  current_time = t;
+}
+
+static time_t get_time(void) {
+  return current_time;
+}
+#else
+static time_t get_time(void) {
+  return time(NULL);
+}
+#endif
+
+static int comparator(const void *a, const void *b) {
+  return *(unsigned int *)a - *(unsigned int *)b;
+}
+
+static char *get_cfg_value(pam_handle_t *pamh, const char *key,
+                           const char *buf) {
+  const size_t key_len = strlen(key);
+  for (const char *line = buf; *line; ) {
+    const char *ptr;
+    if (line[0] == '"' && line[1] == ' ' && !strncmp(line+2, key, key_len) &&
+        (!*(ptr = line+2+key_len) || *ptr == ' ' || *ptr == '\t' ||
+         *ptr == '\r' || *ptr == '\n')) {
+      ptr += strspn(ptr, " \t");
+      size_t val_len = strcspn(ptr, "\r\n");
+      char *val = malloc(val_len + 1);
+      if (!val) {
+        log_message(LOG_ERR, pamh, "Out of memory");
+        return &oom;
+      } else {
+        memcpy(val, ptr, val_len);
+        val[val_len] = '\000';
+        return val;
+      }
+    } else {
+      line += strcspn(line, "\r\n");
+      line += strspn(line, "\r\n");
+    }
+  }
+  return NULL;
+}
+
+static int set_cfg_value(pam_handle_t *pamh, const char *key, const char *val,
+                         char **buf) {
+  const size_t key_len = strlen(key);
+  char *start = NULL;
+  char *stop = NULL;
+
+  // Find an existing line, if any.
+  for (char *line = *buf; *line; ) {
+    char *ptr;
+    if (line[0] == '"' && line[1] == ' ' && !strncmp(line+2, key, key_len) &&
+        (!*(ptr = line+2+key_len) || *ptr == ' ' || *ptr == '\t' ||
+         *ptr == '\r' || *ptr == '\n')) {
+      start = line;
+      stop  = start + strcspn(start, "\r\n");
+      stop += strspn(stop, "\r\n");
+      break;
+    } else {
+      line += strcspn(line, "\r\n");
+      line += strspn(line, "\r\n");
+    }
+  }
+
+  // If no existing line, insert immediately after the first line.
+  if (!start) {
+    start  = *buf + strcspn(*buf, "\r\n");
+    start += strspn(start, "\r\n");
+    stop   = start;
+  }
+
+  // Replace [start..stop] with the new contents.
+  const size_t val_len = strlen(val);
+  const size_t total_len = key_len + val_len + 4;
+  if (total_len <= stop - start) {
+    // We are decreasing out space requirements. Shrink the buffer and pad with
+    // NUL characters.
+    const size_t tail_len = strlen(stop);
+    memmove(start + total_len, stop, tail_len + 1);
+    memset(start + total_len + tail_len, 0, stop - start - total_len + 1);
+  } else {
+    // Must resize existing buffer. We cannot call realloc(), as it could
+    // leave parts of the buffer content in unused parts of the heap.
+    const size_t buf_len = strlen(*buf);
+    const size_t tail_len = buf_len - (stop - *buf);
+    char *resized = malloc(buf_len - (stop - start) + total_len + 1);
+    if (!resized) {
+      log_message(LOG_ERR, pamh, "Out of memory");
+      return -1;
+    }
+    memcpy(resized, *buf, start - *buf);
+    memcpy(resized + (start - *buf) + total_len, stop, tail_len + 1);
+    memset(*buf, 0, buf_len);
+    free(*buf);
+    start = start - *buf + resized;
+    *buf = resized;
+  }
+
+  // Fill in new contents.
+  start[0] = '"';
+  start[1] = ' ';
+  memcpy(start + 2, key, key_len);
+  start[2+key_len] = ' ';
+  memcpy(start+3+key_len, val, val_len);
+  start[3+key_len+val_len] = '\n';
+
+  // Check if there are any other occurrences of "value". If so, delete them.
+  for (char *line = start + 4 + key_len + val_len; *line; ) {
+    char *ptr;
+    if (line[0] == '"' && line[1] == ' ' && !strncmp(line+2, key, key_len) &&
+        (!*(ptr = line+2+key_len) || *ptr == ' ' || *ptr == '\t' ||
+         *ptr == '\r' || *ptr == '\n')) {
+      start = line;
+      stop = start + strcspn(start, "\r\n");
+      stop += strspn(stop, "\r\n");
+      size_t tail_len = strlen(stop);
+      memmove(start, stop, tail_len + 1);
+      memset(start + tail_len, 0, stop - start);
+      line = start;
+    } else {
+      line += strcspn(line, "\r\n");
+      line += strspn(line, "\r\n");
+    }
+  }
+
+  return 0;
+}
 
 static int rate_limit(pam_handle_t *pamh, const char *secret_filename,
                       int *updated, char **buf) {
