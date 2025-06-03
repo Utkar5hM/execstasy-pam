@@ -27,8 +27,10 @@
 #define MODULE_NAME   "pamshi_auth"
 
 #define SECRET	"/etc/pamshi/.config"
-#define PROMPT "Enter the following Code or scan the URL with your authenticator app: "
 #define DEVICE_AUTHORIZATION_ENDPOINT "/oauth/device_authorization"
+#define DEVICE_ACCESS_TOKEN_ENDPOINT "/oauth/token"
+#define DEVICE_ACCESS_TOKEN_GRANT_TYPE "urn:ietf:params:oauth:grant-type:device_code"
+
 typedef struct Params{
 	const char* secret_filename_spec;
 	const char * authtok_prompt;
@@ -1156,7 +1158,7 @@ static CURLcode perform_device_authorization(pam_handle_t *pamh, CURL *curl, Par
 }
 
 
-static int parse_json_response(pam_handle_t *pamh, const char *response, char **device_code,
+static int parse_device_auth_json_response(pam_handle_t *pamh, const char *response, char **device_code,
       char **user_code, char **verification_uri, char **verification_uri_complete, int *expires_in, int *interval) {
     cJSON *json = cJSON_Parse(response);
     if (!json) {
@@ -1225,6 +1227,108 @@ static int parse_json_response(pam_handle_t *pamh, const char *response, char **
     return 0;
 }
 
+static CURLcode perform_token_request(pam_handle_t *pamh, CURL *curl, Params *params, 
+        const char *client_id, const char *device_code, char **output, long *http_code) {
+    CURLcode res = CURLE_FAILED_INIT;
+
+    // Allocate and build the full URL
+    size_t url_len = strlen(params->auth_server_url) + strlen(DEVICE_ACCESS_TOKEN_ENDPOINT) + 1;
+    char *url = malloc(url_len);
+    if (!url) {
+        return CURLE_OUT_OF_MEMORY;
+    }
+    snprintf(url, url_len, "%s%s", params->auth_server_url, DEVICE_ACCESS_TOKEN_ENDPOINT);
+
+    // Initialize response buffer
+    *output = calloc(1, sizeof(char)); // Start with an empty string
+    if (!*output) {
+        free(url);
+        return CURLE_OUT_OF_MEMORY;
+    }
+
+    if (curl) {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "POST");
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_DEFAULT_PROTOCOL, "https");
+
+        // Set headers
+        struct curl_slist *headers = NULL;
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+        // Set MIME data
+        curl_mime *mime = curl_mime_init(curl);
+        curl_mimepart *part;
+
+        part = curl_mime_addpart(mime);
+        curl_mime_name(part, "client_id");
+        curl_mime_data(part, client_id, CURL_ZERO_TERMINATED);
+
+        part = curl_mime_addpart(mime);
+        curl_mime_name(part, "grant_type");
+        curl_mime_data(part, DEVICE_ACCESS_TOKEN_GRANT_TYPE, CURL_ZERO_TERMINATED);
+
+        part = curl_mime_addpart(mime);
+        curl_mime_name(part, "device_code");
+        curl_mime_data(part, device_code, CURL_ZERO_TERMINATED);
+
+        curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
+
+        // Set the callback function to capture the response
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, output);
+
+        // Perform the request
+        res = curl_easy_perform(curl);
+        if (res == CURLE_OK) {
+            // Get the HTTP response code
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, http_code);
+        } else {
+            *http_code = 0; // Set to 0 on error
+        } 
+        // Free resources
+        curl_mime_free(mime);
+        curl_slist_free_all(headers);
+    }
+
+    free(url);
+    return res;
+}
+
+
+static int parse_token_json_response(pam_handle_t *pamh, const char *response, char **error,
+    char **error_description, char **client_id) {
+    cJSON *json = cJSON_Parse(response);
+    if (!json) {
+        log_message(LOG_ERR, pamh, "Failed to parse JSON response");
+        return -1;
+    }
+    // Extract "error" optional
+    cJSON *error_item = cJSON_GetObjectItemCaseSensitive(json, "error");
+    if (cJSON_IsString(error_item) && (error_item->valuestring != NULL)) {
+        *error = strdup(error_item->valuestring);
+    } else {
+        *error = NULL;
+    }
+
+    // Extract "error" optional
+    cJSON *error_description_item = cJSON_GetObjectItemCaseSensitive(json, "error_description");
+    if (cJSON_IsString(error_description_item) && (error_description_item->valuestring != NULL)) {
+        *error_description = strdup(error_description_item->valuestring);
+    } else {
+        *error_description = NULL;
+    }
+    // Extract "client_id" optional
+    cJSON *client_id_item = cJSON_GetObjectItemCaseSensitive(json, "client_id");
+    if (cJSON_IsString(client_id_item) && (client_id_item->valuestring != NULL)) {
+        *client_id = strdup(client_id_item->valuestring);
+    } else {
+        *client_id = NULL;
+    }
+    cJSON_Delete(json);
+    return 0;
+}
+
 PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags UNUSED_ATTR,
 				   int argc, const char **argv) {
 	int rc = PAM_AUTH_ERR;
@@ -1241,10 +1345,6 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags UNUSED_ATTR,
 	if (parse_args(pamh, argc, argv, &params) < 0) {
 		return rc;
 	}
-	
-	const char *prompt = params.authtok_prompt ? 
-		params.authtok_prompt : PROMPT;
-
 	int early_updated = 0, updated = 0;
 	const char* const username = get_user_name(pamh, &params);
 	char* const secret_filename = get_secret_filename(pamh, &params,
@@ -1322,13 +1422,16 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags UNUSED_ATTR,
           rc = PAM_BUF_ERR;
           goto out;
       }
-      if (parse_json_response(pamh, output, &device_code, &user_code, &verification_uri, &verification_uri_complete , expires_in, interval) == 0) {
+      if (parse_device_auth_json_response(pamh, output, &device_code, &user_code,
+             &verification_uri, &verification_uri_complete , expires_in, interval) == 0) {
           free(output);
       } else {
         log_message(LOG_ERR, pamh, "Failed to parse JSON response");
         goto out;
       }
-
+      log_message(LOG_INFO, pamh, "Device code: %s", device_code);
+      time_t expires_at = get_time() + *expires_in;
+      log_message(LOG_INFO, pamh, "Expires at: %ld", expires_at);
       // Dynamically allocate memory for the prompt message
       static char* qrcode = NULL;
       enum QRMode qr_mode = QR_UTF8;
@@ -1372,10 +1475,69 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags UNUSED_ATTR,
       }
 
       free(prompt_message); // Free the dynamically allocated prompt message
-      sleep(5);
-      rc = PAM_SUCCESS;
+
+      sleep(*((unsigned int*)interval));
+      for(;;){
+        if(expires_at > get_time()) {
+        char *error = NULL, *error_description = NULL, *client_id = NULL;
+          char* token_req_output = NULL;
+          long http_code = 0;
+          // Check if the user has completed the authorization
+          res = perform_token_request(pamh, curl, &params, secret, device_code, &token_req_output, &http_code);
+          if (res == CURLE_OK) {
+            if (parse_token_json_response(pamh, token_req_output, &error, &error_description, &client_id) != 0) {
+              log_message(LOG_ERR, pamh, "Failed to parse token response, Let's try requesting again");
+              continue;
+            }
+            if (http_code==200) {
+              if ((client_id!=NULL) && strcmp(client_id,(char *)secret)==0) {
+                if (params.debug) log_message(LOG_INFO, pamh, "Access granted for client_id: %s", client_id);
+                rc = PAM_SUCCESS;
+              } else {
+                if (params.debug) log_message(LOG_ERR, pamh, "Client ID not found in response");
+              }
+            } else if(http_code==400 && error!=NULL) {
+              if (strcmp(error,"authorization_pending")==0 || strcmp(error,"slow_down")==0){
+                if(strcmp(error,"slow_down")==0)*interval = ((*(unsigned int*)interval)+5);
+                log_message(LOG_DEBUG, pamh, "Retrying after waiting for %d seconds", *interval);
+                sleep(*((unsigned int*)interval));
+                free(error);
+                free(error_description);
+                free(client_id);
+                continue;
+              } if(strcmp(error,"expired_token")==0 || strcmp(error,"access_denied")==0){
+                if (params.debug) log_message(LOG_ERR, pamh, "Access denied or expired token");
+              } else if (strcmp(error,"invalid_request")==0 || strcmp(error,"invalid_client")==0 || strcmp(error,"invalid_grant")==0) {
+                if (params.debug) log_message(LOG_ERR, pamh, "Unknown error in the backend: %s", error);
+              }
+            } else {
+              if (params.debug) log_message(LOG_ERR, pamh, "Unexpected HTTP code: %ld", http_code);
+                sleep(*((unsigned int*)interval));
+                free(error);
+                free(error_description);
+                free(client_id);
+                continue;
+            }
+          } else {
+            if (params.debug) log_message(LOG_ERR, pamh, "Error occurred while requesting access token");
+            sleep(*((unsigned int*)interval));
+          }
+          free(error);
+          free(error_description);
+          free(client_id);
+          if(token_req_output){
+            free(token_req_output);
+          }
+          break;
+        } else {
+          log_message(LOG_ERR, pamh, "Device code expired");
+          rc = PAM_AUTH_ERR;
+          break;
+        }
+      }
   }
-  char *saved_pw = NULL;
+
+
 	// If the user has not created a state file with a shared secret, and if
 	// the administrator set the "nullok" option, this PAM module completes
 	// without saying success or failure, without ever prompting the user.
