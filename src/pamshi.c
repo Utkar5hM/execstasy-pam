@@ -27,8 +27,8 @@
 #define MODULE_NAME   "pamshi_auth"
 
 #define SECRET	"/etc/pamshi/.config"
-#define DEVICE_AUTHORIZATION_ENDPOINT "/oauth/device_authorization"
-#define DEVICE_ACCESS_TOKEN_ENDPOINT "/oauth/token"
+#define DEVICE_AUTHORIZATION_ENDPOINT "/api/oauth/device_authorization"
+#define DEVICE_ACCESS_TOKEN_ENDPOINT "/api/oauth/token"
 #define DEVICE_ACCESS_TOKEN_GRANT_TYPE "urn:ietf:params:oauth:grant-type:device_code"
 
 typedef struct Params{
