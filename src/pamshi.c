@@ -1450,8 +1450,12 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags UNUSED_ATTR,
       }
       // Create the prompt message
       snprintf(prompt_message, prompt_len,
-              "This Device is protected by Pam Shi(t)\nVisit: %s \nAnd enter the user code: %s\nOr Scan the below QR Code:\n%s",
-              verification_uri, user_code, qrcode);
+              "This Device is protected by Execstasy\n"
+              "Visit: %s\n"
+              "or Visit: %s \nAnd enter the user code: %s\n"
+              "Or Scan the below QR Code:\n%s\n"
+              "Please press enter after approving the device.\n:",
+              verification_uri_complete, verification_uri, user_code, qrcode);
       free(qrcode);
       // Prepare the PAM message
       struct pam_message msg = {
