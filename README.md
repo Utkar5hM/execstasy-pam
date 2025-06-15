@@ -1,8 +1,8 @@
-# pamshi - Linux PAM Module for OAuth 2.0 Device Authorization Grant ([RFC 8628](https://datatracker.ietf.org/doc/html/rfc8628))
+# Execstasy - Linux PAM Module for OAuth 2.0 Device Authorization Grant ([RFC 8628](https://datatracker.ietf.org/doc/html/rfc8628))
 
-> Built to be used with [delulufam - An IAM for Linux Instances](https://github.com/Utkar5hM/delulufam).
+> Built to be used with [Execstacy - An IAM for Linux Instances](https://github.com/Utkar5hM/Execstasy).
 >
-> NOTE: It's a repurposed project for now and so the name, it will be changed later someday.
+> NOTE: It's currently a private repository. :D
 
 ![screenshot](image.png)
 
@@ -61,7 +61,20 @@ journalctl -f SYSLOG_IDENTIFIER="service(pamshi_auth)"
 journalctl -f SYSLOG_IDENTIFIER="sshd(pamshi_auth)"
 ```
 
+### Configuring sshd
+
+Make sure you have the following set in sshd's config (`/etc/ssh/sshd_config`). change as required but make sure to also check files in `/etc/ssh/sshd_config.d/` directory for conflicting configuration.
+ 
+```
+UsePAM yes
+ChallengeResponseAuthentication yes
+PasswordAuthentication yes
+PubkeyAuthentication yes
+KbdInteractiveAuthentication yes
+PermitTTY yes
+
+```
 ------------
 
 
-This project is heavily inspired (`blatantly copied several functions`) from [google-authenticator-libpam)](https://github.com/google/google-authenticator-libpam). Therefore, it can be used as an example on how to configure this PAM Module for a while.
+This project is heavily inspired from [google-authenticator-libpam)](https://github.com/google/google-authenticator-libpam). Hence, it can be used as an example on how to configure this PAM Module.
