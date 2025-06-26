@@ -56,19 +56,19 @@
 #define LT_OBJDIR ".libs/"
 
 /* Name of package */
-#define PACKAGE "pamshi"
+#define PACKAGE "execstasy"
 
 /* Define to the address where bug reports for this package should be sent. */
 #define PACKAGE_BUGREPORT "utkarshrm568@gmail.com"
 
 /* Define to the full name of this package. */
-#define PACKAGE_NAME "pamshi"
+#define PACKAGE_NAME "execstasy"
 
 /* Define to the full name and version of this package. */
-#define PACKAGE_STRING "pamshi 1.0"
+#define PACKAGE_STRING "execstasy 1.0"
 
 /* Define to the one symbol short name of this package. */
-#define PACKAGE_TARNAME "pamshi"
+#define PACKAGE_TARNAME "execstasy"
 
 /* Define to the home page for this package. */
 #define PACKAGE_URL ""

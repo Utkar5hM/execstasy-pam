@@ -1,7 +1,7 @@
 SRC_DIR := ./src
 BUILD_DIR := ./build
 OUTPUT_DIR := ./output
-TARGET := $(OUTPUT_DIR)/pamshi.so
+TARGET := $(OUTPUT_DIR)/execstasy.so
 LIB_DIR := /lib64/security
 
 SRCS := $(wildcard $(SRC_DIR)/*.c)
@@ -29,7 +29,7 @@ $(TARGET): $(OBJS) | $(OUTPUT_DIR)
 	$(CC) $(LDFLAGS) -o $@ $^
 
 install: $(TARGET)
-	sudo cp $(TARGET) $(LIB_DIR)/pamshi.so
+	sudo cp $(TARGET) $(LIB_DIR)/execstasy.so
 
 test: install
 	sudo pamtester -v $(TEST_SERVICE) $(USER) authenticate

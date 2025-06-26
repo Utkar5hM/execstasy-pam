@@ -28,14 +28,14 @@ You need to add the following line to your application's respective PAM configur
 # for sshd ( /etc/pam.d/sshd )
 # for pamtester ( /etc/pam.d/pamtester )
 
-auth sufficient pamshi.so debug user=root auth_server_url=http://localhost:4000
+auth sufficient execstasy.so debug user=root auth_server_url=http://localhost:4000
 ```
 
-> In `user=username`, the username specifies the user with which the secrets file containing base32 encoded clientId will be opened. The file needs to have `0600` perm and owned by that user. 
+> In `user=username`, the username specifies the user with which the secrets file containing encoded clientId will be opened. The file needs to have `0600` perm and owned by that user. 
 >
-> The secret is by default stored at `/etc/pamshi/.config`
+> The secret (client-id obtained from the Execstasy site) is by default read from `/etc/execstasy/.config`, is base32 encoded without the `=`. 
 >
-> Debug is not necessary
+> debug parameter is not necessary
 
 ### test
 
@@ -56,9 +56,9 @@ make clean
 ### debugging
 replace `service` with the service you will be using the PAM module with.
 ```sh
-journalctl -f SYSLOG_IDENTIFIER="service(pamshi_auth)"
+journalctl -f SYSLOG_IDENTIFIER="service(execstasy_auth)"
 # ex- for sshd
-journalctl -f SYSLOG_IDENTIFIER="sshd(pamshi_auth)"
+journalctl -f SYSLOG_IDENTIFIER="sshd(execstasy_auth)"
 ```
 
 ### Configuring sshd

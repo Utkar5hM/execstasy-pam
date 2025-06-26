@@ -24,9 +24,9 @@
 #include <sys/fsuid.h>
 #endif
 
-#define MODULE_NAME   "pamshi_auth"
+#define MODULE_NAME   "execstasy_auth"
 
-#define SECRET	"/etc/pamshi/.config"
+#define SECRET	"/etc/execstasy/.config"
 #define DEVICE_AUTHORIZATION_ENDPOINT "/api/oauth/device_authorization"
 #define DEVICE_ACCESS_TOKEN_ENDPOINT "/api/oauth/token"
 #define DEVICE_ACCESS_TOKEN_GRANT_TYPE "urn:ietf:params:oauth:grant-type:device_code"
@@ -96,7 +96,7 @@ static const char* get_user_name(pam_handle_t *pamh, const Params *params){
 		return NULL;
 	}
 	if (params->debug){
-		log_message(LOG_INFO, pamh, "debug: start of pamshi authenticator for \"%s\"", username);
+		log_message(LOG_INFO, pamh, "debug: start of execstasy authenticator for \"%s\"", username);
 	}
 	return username;
 }
@@ -122,7 +122,7 @@ get_rhost(pam_handle_t *pamh, const Params *params) {
     return NULL;
   }
   if (params->debug) {
-    log_message(LOG_INFO, pamh, "debug: pamshi for host \"%s\"",
+    log_message(LOG_INFO, pamh, "debug: execstasy for host \"%s\"",
                 rhost);
   }
   return (const char *)rhost;
@@ -366,7 +366,7 @@ static int drop_privileges(pam_handle_t *pamh, const char *username, int uid,
 static int open_secret_file(pam_handle_t *pamh, const char *secret_filename,
                             struct Params *params, const char *username,
                             int uid, struct stat *orig_stat) {
-  // Try to open "pamshi config"
+  // Try to open "execstasy config"
   const int fd = open(secret_filename, O_RDONLY);
   if (fd < 0 ||
       fstat(fd, orig_stat) < 0) {
@@ -393,7 +393,7 @@ static int open_secret_file(pam_handle_t *pamh, const char *secret_filename,
                 orig_stat->st_mode & 03777, params->allowed_perm);
   }
 
-  // Check permissions on "pamshi config".
+  // Check permissions on "execstasy config".
   if (!S_ISREG(orig_stat->st_mode)) {
     log_message(LOG_ERR, pamh, "Secret file \"%s\" is not a regular file",
                 secret_filename);
@@ -1581,7 +1581,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags UNUSED_ATTR,
 	out:
 	if (params.debug) {
 		log_message(LOG_INFO, pamh,
-					"debug: end of pamshi for \"%s\". Result: %s",
+					"debug: end of execstasy for \"%s\". Result: %s",
 					username, pam_strerror(pamh, rc));
 	}
 	if (fd >= 0) {
